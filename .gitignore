@@ -1,0 +1,20 @@
+# Local environment variables
+.env
+*.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Go compiled binaries & dependencies
+pipeline/bin/
+*.exe
+*.test
+
+# OS & IDE junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
