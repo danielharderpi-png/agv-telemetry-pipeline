@@ -13,6 +13,9 @@ pipeline/bin/
 *.exe
 *.test
 
+# Large local demo recordings
+docs/demo.mp4
+
 # OS & IDE junk
 .DS_Store
 Thumbs.db
