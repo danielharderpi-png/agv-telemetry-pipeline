@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AGV Fleet Dispatch // Warehouse Telemetry</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #020617;
+    }
+    /* Custom subtle scrollbar for internal panels only */
+    .panel-scroll::-webkit-scrollbar {
+      width: 5px;
+    }
+    .panel-scroll::-webkit-scrollbar-track {
+      background: #0f172a;
+    }
+    .panel-scroll::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 3px;
+    }
+    .panel-scroll::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+  </style>
+</head>
+<body class="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col select-none font-sans">
+
+  <!-- Top Banner -->
+  <header class="h-14 shrink-0 bg-slate-900/95 border-b border-slate-800 px-4 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3 min-w-0">
+      <div class="w-8 h-8 rounded bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center shrink-0">
+        <svg class="w-4 h-4 text-cyan-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+        </svg>
+      </div>
+      <div class="min-w-0">
+        <h1 class="text-sm font-bold tracking-wider uppercase text-slate-100 truncate">AGV Fleet Dispatch</h1>
+        <p class="text-[11px] font-mono text-slate-400 tracking-wide truncate">WAREHOUSE TELEMETRY // 100m × 80m FLOOR</p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-3 sm:gap-5 shrink-0">
+      <!-- Pipeline Status Badge -->
+      <div class="flex items-center gap-2 bg-slate-950/80 border border-slate-800 rounded-md px-3 py-1.5">
+        <span class="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Pipeline</span>
+        <span id="pipelineBadge" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono font-bold bg-rose-500/15 text-rose-400 border border-rose-500/40">
+          <span id="pipelineDot" class="w-2 h-2 rounded-full bg-rose-500"></span>
+          <span id="pipelineStatusText">DISCONNECTED</span>
+        </span>
+      </div>
+
+      <!-- Throughput -->
+      <div class="flex items-center gap-2.5 bg-slate-950/80 border border-slate-800 rounded-md px-3 py-1.5">
+        <span class="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Throughput</span>
+        <span class="font-mono tabular-nums text-sm font-bold text-cyan-400">
+          <span id="eventsPerSec">0.0</span>
+          <span class="text-[11px] font-normal text-slate-400">ev/s</span>
+        </span>
+      </div>
+
+      <!-- Active AGVs -->
+      <div class="flex items-center gap-2.5 bg-slate-950/80 border border-slate-800 rounded-md px-3 py-1.5">
+        <span class="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Active AGVs</span>
+        <span id="activeAgvs" class="font-mono tabular-nums text-sm font-bold text-emerald-400">0</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <main class="flex-1 min-h-0 grid grid-cols-12 gap-3 p-3">
+
+    <!-- Left Panel: Warehouse Floor Map + Fleet Roster -->
+    <section class="col-span-12 lg:col-span-8 flex flex-col gap-3 min-h-0">
+
+      <!-- Floor Map Card -->
+      <div class="flex-1 min-h-0 bg-slate-900/90 border border-slate-800 rounded-lg flex flex-col overflow-hidden">
+        <div class="h-9 shrink-0 px-3.5 border-b border-slate-800/90 flex items-center justify-between gap-2 bg-slate-900">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-200">Warehouse Floor Map</span>
+            <span class="text-[11px] font-mono text-slate-500">100.0m × 80.0m</span>
+          </div>
+          <div class="flex items-center gap-3 text-[11px] font-mono text-slate-300">
+            <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>Normal</span>
+            <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>Charging / &lt;25%</span>
+            <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-rose-500"></span>Error / &lt;15%</span>
+          </div>
+        </div>
+
+        <div id="mapContainer" class="flex-1 min-h-0 relative bg-slate-950 p-2">
+          <canvas id="floorCanvas" class="w-full h-full block cursor-default"></canvas>
+          <div id="emptyMapOverlay" class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div class="bg-slate-900/90 border border-slate-700/80 rounded-lg px-4 py-2.5 text-center">
+              <p class="text-xs font-mono text-slate-300">Waiting for live AGV telemetry stream...</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Fleet Roster (Clickable 5x2 Grid) -->
+      <div class="shrink-0 bg-slate-900/90 border border-slate-800 rounded-lg p-2.5">
+        <div class="flex items-center justify-between mb-2 px-1">
+          <span class="text-[11px] font-bold uppercase tracking-wider text-slate-300">Fleet Roster</span>
+          <span class="text-[11px] font-mono text-slate-500">Click vehicle to inspect</span>
+        </div>
+        <div id="fleetList" class="grid grid-cols-5 gap-2">
+          <!-- Populated dynamically -->
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Panel: Selected Vehicle & Alerts -->
+    <aside class="col-span-12 lg:col-span-4 flex flex-col gap-3 min-h-0">
+
+      <!-- Selected Vehicle Vital Signs -->
+      <div class="shrink-0 bg-slate-900/90 border border-slate-800 rounded-lg overflow-hidden">
+        <div class="h-9 px-3.5 border-b border-slate-800/90 flex items-center justify-between bg-slate-900">
+          <span class="text-xs font-bold uppercase tracking-wider text-slate-200">Selected Vehicle</span>
+          <span id="selectedDeviceId" class="font-mono text-xs font-bold text-cyan-400">--</span>
+        </div>
+
+        <div class="p-3.5 space-y-3">
+          <!-- Identity & Status Badge -->
+          <div class="flex items-center justify-between gap-2">
+            <div>
+              <div class="text-[10px] uppercase tracking-wider text-slate-400">Operational State</div>
+              <div id="selectedHealthLabel" class="text-xs font-mono text-slate-300 mt-0.5">Awaiting telemetry</div>
+            </div>
+            <span id="selectedStatusBadge" class="px-2.5 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider bg-slate-800 text-slate-300 border border-slate-700">
+              OFFLINE
+            </span>
+          </div>
+
+          <!-- Battery Gauge Bar -->
+          <div class="bg-slate-950/70 border border-slate-800/80 rounded-md p-2.5">
+            <div class="flex items-center justify-between text-xs mb-1.5">
+              <span class="text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Battery Charge</span>
+              <span id="selectedBatteryText" class="font-mono tabular-nums font-bold text-slate-200">--%</span>
+            </div>
+            <div class="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
+              <div id="selectedBatteryBar" class="h-full bg-emerald-500 transition-all duration-300" style="width: 0%"></div>
+            </div>
+          </div>
+
+          <!-- Vital Sign Metrics -->
+          <div class="grid grid-cols-3 gap-2">
+            <div class="bg-slate-950/70 border border-slate-800/80 rounded-md p-2">
+              <div class="text-[10px] uppercase tracking-wider text-slate-400">Speed</div>
+              <div class="font-mono tabular-nums text-sm font-bold text-slate-100 mt-0.5">
+                <span id="selectedSpeed">0.00</span> <span class="text-[10px] font-normal text-slate-400">m/s</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950/70 border border-slate-800/80 rounded-md p-2">
+              <div class="text-[10px] uppercase tracking-wider text-slate-400">Coords (X, Y)</div>
+              <div id="selectedCoords" class="font-mono tabular-nums text-xs font-bold text-slate-100 mt-1 truncate">
+                --, --
+              </div>
+            </div>
+
+            <div class="bg-slate-950/70 border border-slate-800/80 rounded-md p-2">
+              <div class="text-[10px] uppercase tracking-wider text-slate-400">Ping Age</div>
+              <div id="selectedPingAge" class="font-mono tabular-nums text-sm font-bold text-slate-100 mt-0.5">
+                --
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recent Alerts Feed -->
+      <div class="flex-1 min-h-0 bg-slate-900/90 border border-slate-800 rounded-lg flex flex-col overflow-hidden">
+        <div class="h-9 shrink-0 px-3.5 border-b border-slate-800/90 flex items-center justify-between bg-slate-900">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-bold uppercase tracking-wider text-slate-200">Recent Alerts</span>
+            <span id="alertCountBadge" class="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800 text-slate-300">0</span>
+          </div>
+          <button id="clearAlertsBtn" type="button" class="text-[11px] font-mono text-slate-400 hover:text-slate-200 transition-colors">
+            Clear
+          </button>
+        </div>
+
+        <div id="alertsFeed" class="flex-1 min-h-0 overflow-y-auto panel-scroll p-2.5 space-y-2">
+          <div id="noAlertsPlaceholder" class="h-full flex items-center justify-center text-xs font-mono text-slate-500">
+            No active faults or low-battery alerts.
+          </div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    (() => {
+      const WAREHOUSE_W = 100.0;
+      const WAREHOUSE_H = 80.0;
+      const CHARGING_STATIONS = [
+        { x: 5.0, y: 5.0, label: 'CHG-1' },
+        { x: 5.0, y: 75.0, label: 'CHG-2' },
+        { x: 95.0, y: 5.0, label: 'CHG-3' }
+      ];
+      const DOCK_STATIONS = [
+        { x: 20.0, y: 40.0, label: 'DOCK-W' },
+        { x: 50.0, y: 20.0, label: 'DOCK-N' },
+        { x: 50.0, y: 60.0, label: 'DOCK-S' },
+        { x: 80.0, y: 40.0, label: 'DOCK-E' }
+      ];
+      const RACK_ZONES = [
+        { x: 16, y: 10, w: 20, h: 16, label: 'AISLE A' },
+        { x: 64, y: 10, w: 20, h: 16, label: 'AISLE B' },
+        { x: 16, y: 54, w: 20, h: 16, label: 'AISLE C' },
+        { x: 64, y: 54, w: 20, h: 16, label: 'AISLE D' }
+      ];
+
+      const MAX_ALERTS = 60;
+      const ALERT_THROTTLE_MS = 15000;
+
+      // In-memory state keyed by device_id
+      const agvs = new Map();
+      const alerts = [];
+      const lastAlertByKey = new Map();
+
+      let selectedId = null;
+      let hoveredId = null;
+      let wsConnected = false;
+      let serverHealthy = false;
+      let lastTransform = null;
+
+      // DOM refs
+      const pipelineBadge = document.getElementById('pipelineBadge');
+      const pipelineDot = document.getElementById('pipelineDot');
+      const pipelineStatusText = document.getElementById('pipelineStatusText');
+      const eventsPerSecEl = document.getElementById('eventsPerSec');
+      const activeAgvsEl = document.getElementById('activeAgvs');
+
+      const mapContainer = document.getElementById('mapContainer');
+      const canvas = document.getElementById('floorCanvas');
+      const ctx = canvas.getContext('2d');
+      const emptyMapOverlay = document.getElementById('emptyMapOverlay');
+      const fleetListEl = document.getElementById('fleetList');
+
+      const selectedDeviceIdEl = document.getElementById('selectedDeviceId');
+      const selectedHealthLabelEl = document.getElementById('selectedHealthLabel');
+      const selectedStatusBadgeEl = document.getElementById('selectedStatusBadge');
+      const selectedBatteryTextEl = document.getElementById('selectedBatteryText');
+      const selectedBatteryBarEl = document.getElementById('selectedBatteryBar');
+      const selectedSpeedEl = document.getElementById('selectedSpeed');
+      const selectedCoordsEl = document.getElementById('selectedCoords');
+      const selectedPingAgeEl = document.getElementById('selectedPingAge');
+
+      const alertsFeedEl = document.getElementById('alertsFeed');
+      const noAlertsPlaceholderEl = document.getElementById('noAlertsPlaceholder');
+      const alertCountBadgeEl = document.getElementById('alertCountBadge');
+      const clearAlertsBtn = document.getElementById('clearAlertsBtn');
+
+      function classifyVehicle(ev) {
+        const status = (ev.status || '').toUpperCase();
+        const bat = Number(ev.battery_level ?? 0);
+
+        if (bat < 15 || status === 'ERROR' || status === 'STALLED') {
+          return {
+            tier: 'red',
+            hex: '#ef4444',
+            ring: 'rgba(239, 68, 68, 0.35)',
+            badgeClass: 'bg-rose-500/15 text-rose-400 border-rose-500/40',
+            barClass: 'bg-rose-500',
+            dotClass: 'bg-rose-500',
+            health: status === 'ERROR' || status === 'STALLED' ? `FAULT (${status})` : 'CRITICAL BATTERY'
+          };
+        }
+        if (bat < 25 || status === 'CHARGING') {
+          return {
+            tier: 'amber',
+            hex: '#f59e0b',
+            ring: 'rgba(245, 158, 11, 0.30)',
+            badgeClass: 'bg-amber-500/15 text-amber-400 border-amber-500/40',
+            barClass: 'bg-amber-500',
+            dotClass: 'bg-amber-500',
+            health: status === 'CHARGING' ? 'RECHARGING' : 'LOW BATTERY'
+          };
+        }
+        return {
+          tier: 'green',
+          hex: '#10b981',
+          ring: 'rgba(16, 185, 129, 0.25)',
+          badgeClass: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40',
+          barClass: 'bg-emerald-500',
+          dotClass: 'bg-emerald-500',
+          health: 'NOMINAL'
+        };
+      }
+
+      function updatePipelineBanner(metrics) {
+        const healthy = wsConnected && serverHealthy;
+        if (healthy) {
+          pipelineBadge.className = 'inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/40';
+          pipelineDot.className = 'w-2 h-2 rounded-full bg-emerald-400 animate-pulse';
+          pipelineStatusText.textContent = 'HEALTHY';
+        } else {
+          pipelineBadge.className = 'inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono font-bold bg-rose-500/15 text-rose-400 border border-rose-500/40';
+          pipelineDot.className = 'w-2 h-2 rounded-full bg-rose-500';
+          pipelineStatusText.textContent = 'DISCONNECTED';
+        }
+
+        if (metrics) {
+          eventsPerSecEl.textContent = Number(metrics.events_per_sec ?? 0).toFixed(1);
+          activeAgvsEl.textContent = String(metrics.active_agvs ?? agvs.size);
+        } else {
+          activeAgvsEl.textContent = String(agvs.size);
+        }
+      }
+
+      function maybeRecordAlerts(ev) {
+        const status = (ev.status || '').toUpperCase();
+        const bat = Number(ev.battery_level ?? 100);
+        const now = Date.now();
+
+        const triggers = [];
+        if (status === 'ERROR' || status === 'STALLED') {
+          triggers.push({
+            key: `${ev.device_id}:STATUS:${status}`,
+            severity: 'CRITICAL',
+            message: `Vehicle entered ${status} state at (${ev.x_coord.toFixed(1)}m, ${ev.y_coord.toFixed(1)}m)`
+          });
+        }
+        if (bat < 20) {
+          const sev = bat < 15 ? 'CRITICAL' : 'WARNING';
+          triggers.push({
+            key: `${ev.device_id}:LOWBAT:${sev}`,
+            severity: sev,
+            message: `Low battery: ${bat.toFixed(1)}% (${status})`
+          });
+        }
+
+        let added = false;
+        for (const t of triggers) {
+          const prevAt = lastAlertByKey.get(t.key) || 0;
+          if (now - prevAt < ALERT_THROTTLE_MS) {
+            continue;
+          }
+          lastAlertByKey.set(t.key, now);
+          alerts.unshift({
+            id: `${t.key}:${now}`,
+            deviceId: ev.device_id,
+            severity: t.severity,
+            message: t.message,
+            time: new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+          });
+          added = true;
+        }
+
+        if (added) {
+          if (alerts.length > MAX_ALERTS) {
+            alerts.length = MAX_ALERTS;
+          }
+          renderAlerts();
+        }
+      }
+
+      function renderAlerts() {
+        alertCountBadgeEl.textContent = String(alerts.length);
+        if (alerts.length === 0) {
+          alertsFeedEl.innerHTML = '';
+          alertsFeedEl.appendChild(noAlertsPlaceholderEl);
+          return;
+        }
+
+        const frag = document.createDocumentFragment();
+        for (const item of alerts) {
+          const isCrit = item.severity === 'CRITICAL';
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = `w-full text-left rounded-md px-2.5 py-2 border transition-colors ${
+            isCrit
+              ? 'bg-rose-950/35 border-rose-500/40 hover:bg-rose-950/60'
+              : 'bg-amber-950/30 border-amber-500/35 hover:bg-amber-950/55'
+          }`;
+          row.onclick = () => selectAgv(item.deviceId);
+
+          row.innerHTML = `
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold ${
+                  isCrit ? 'bg-rose-500/20 text-rose-300' : 'bg-amber-500/20 text-amber-300'
+                }">${item.severity}</span>
+                <span class="font-mono text-xs font-bold text-slate-100">${item.deviceId}</span>
+              </div>
+              <span class="font-mono text-[10px] text-slate-400">${item.time}</span>
+            </div>
+            <div class="text-[11px] font-mono text-slate-300 mt-1">${item.message}</div>
+          `;
+          frag.appendChild(row);
+        }
+
+        alertsFeedEl.innerHTML = '';
+        alertsFeedEl.appendChild(frag);
+      }
+
+      function renderFleetList() {
+        const sorted = Array.from(agvs.values()).sort((a, b) => a.device_id.localeCompare(b.device_id));
+        const frag = document.createDocumentFragment();
+
+        for (const agv of sorted) {
+          const cls = classifyVehicle(agv);
+          const isSelected = agv.device_id === selectedId;
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.onclick = () => selectAgv(agv.device_id);
+          btn.className = `text-left rounded-md px-2 py-1.5 border transition-all ${
+            isSelected
+              ? 'bg-cyan-500/15 border-cyan-400 shadow-[0_0_0_1px_rgba(34,211,238,0.35)]'
+              : 'bg-slate-950/75 border-slate-800 hover:border-slate-600'
+          }`;
+
+          btn.innerHTML = `
+            <div class="flex items-center justify-between gap-1">
+              <span class="font-mono text-[11px] font-bold text-slate-100 truncate">${agv.device_id}</span>
+              <span class="w-2 h-2 rounded-full shrink-0 ${cls.dotClass}"></span>
+            </div>
+            <div class="flex items-center justify-between gap-1 mt-1 text-[10px] font-mono">
+              <span class="text-slate-400 truncate">${agv.status}</span>
+              <span class="tabular-nums font-semibold text-slate-200">${Number(agv.battery_level).toFixed(0)}%</span>
+            </div>
+          `;
+          frag.appendChild(btn);
+        }
+
+        fleetListEl.innerHTML = '';
+        fleetListEl.appendChild(frag);
+      }
+
+      function renderSelectedPanel() {
+        if (!selectedId || !agvs.has(selectedId)) {
+          return;
+        }
+        const ev = agvs.get(selectedId);
+        const cls = classifyVehicle(ev);
+        const bat = Math.max(0, Math.min(100, Number(ev.battery_level ?? 0)));
+
+        selectedDeviceIdEl.textContent = ev.device_id;
+        selectedHealthLabelEl.textContent = cls.health;
+        selectedStatusBadgeEl.textContent = ev.status || 'UNKNOWN';
+        selectedStatusBadgeEl.className = `px-2.5 py-1 rounded text-xs font-mono font-bold uppercase tracking-wider border ${cls.badgeClass}`;
+
+        selectedBatteryTextEl.textContent = `${bat.toFixed(1)}%`;
+        selectedBatteryBarEl.style.width = `${bat.toFixed(1)}%`;
+        selectedBatteryBarEl.className = `h-full transition-all duration-300 ${cls.barClass}`;
+
+        selectedSpeedEl.textContent = Number(ev.speed ?? 0).toFixed(2);
+        selectedCoordsEl.textContent = `${Number(ev.x_coord ?? 0).toFixed(1)}, ${Number(ev.y_coord ?? 0).toFixed(1)}`;
+        updatePingAge();
+      }
+
+      function updatePingAge() {
+        if (!selectedId || !agvs.has(selectedId)) {
+          selectedPingAgeEl.textContent = '--';
+          return;
+        }
+        const ev = agvs.get(selectedId);
+        const ageMs = Math.max(0, Date.now() - ev.receivedAtMs);
+        if (ageMs < 1000) {
+          selectedPingAgeEl.textContent = `${Math.round(ageMs)} ms`;
+          selectedPingAgeEl.className = 'font-mono tabular-nums text-sm font-bold text-emerald-400 mt-0.5';
+        } else {
+          const secs = (ageMs / 1000).toFixed(1);
+          selectedPingAgeEl.textContent = `${secs} s`;
+          selectedPingAgeEl.className = `font-mono tabular-nums text-sm font-bold mt-0.5 ${
+            ageMs > 5000 ? 'text-rose-400' : 'text-amber-300'
+          }`;
+        }
+      }
+
+      function selectAgv(deviceId) {
+        if (!agvs.has(deviceId)) return;
+        selectedId = deviceId;
+        renderFleetList();
+        renderSelectedPanel();
+      }
+
+      function upsertTelemetry(ev, fromSnapshot = false) {
+        if (!ev || !ev.device_id) return;
+
+        const existing = agvs.get(ev.device_id);
+        const now = Date.now();
+        const prevX = existing ? existing.renderX : ev.x_coord;
+        const prevY = existing ? existing.renderY : ev.y_coord;
+
+        const dx = ev.x_coord - prevX;
+        const dy = ev.y_coord - prevY;
+        const heading = (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01)
+          ? Math.atan2(dy, dx)
+          : (existing ? existing.heading : 0);
+
+        const trail = existing ? existing.trail : [];
+        if (!existing || Math.hypot(ev.x_coord - (trail[trail.length - 1]?.x ?? -999), ev.y_coord - (trail[trail.length - 1]?.y ?? -999)) > 0.5) {
+          trail.push({ x: ev.x_coord, y: ev.y_coord });
+          if (trail.length > 14) trail.shift();
+        }
+
+        agvs.set(ev.device_id, {
+          ...ev,
+          renderX: prevX,
+          renderY: prevY,
+          heading,
+          trail,
+          receivedAtMs: now
+        });
+
+        if (!selectedId) {
+          selectedId = ev.device_id;
+        }
+
+        emptyMapOverlay.style.display = 'none';
+        if (!fromSnapshot) {
+          maybeRecordAlerts(ev);
+        }
+      }
+
+      // Canvas sizing & rendering
+      function resizeCanvas() {
+        const rect = mapContainer.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.max(100, Math.floor(rect.width - 16));
+        const h = Math.max(100, Math.floor(rect.height - 16));
+        canvas.width = Math.floor(w * dpr);
+        canvas.height = Math.floor(h * dpr);
+        canvas.style.width = `${w}px`;
+        canvas.style.height = `${h}px`;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }
+
+      const resizeObserver = new ResizeObserver(resizeCanvas);
+      resizeObserver.observe(mapContainer);
+      resizeCanvas();
+
+      function computeFloorTransform() {
+        const cssW = canvas.clientWidth || 600;
+        const cssH = canvas.clientHeight || 480;
+        const padLeft = 38;
+        const padRight = 16;
+        const padTop = 16;
+        const padBottom = 26;
+
+        const availW = Math.max(50, cssW - padLeft - padRight);
+        const availH = Math.max(50, cssH - padTop - padBottom);
+        const scale = Math.min(availW / WAREHOUSE_W, availH / WAREHOUSE_H);
+
+        const floorW = WAREHOUSE_W * scale;
+        const floorH = WAREHOUSE_H * scale;
+        const originX = padLeft + (availW - floorW) / 2;
+        const originY = padTop + (availH - floorH) / 2;
+
+        return { cssW, cssH, originX, originY, floorW, floorH, scale };
+      }
+
+      function toCanvasX(t, wx) {
+        return t.originX + wx * t.scale;
+      }
+
+      function toCanvasY(t, wy) {
+        return t.originY + wy * t.scale;
+      }
+
+      function drawFloor(t) {
+        ctx.clearRect(0, 0, t.cssW, t.cssH);
+
+        // Floor surface
+        ctx.fillStyle = '#091124';
+        ctx.fillRect(t.originX, t.originY, t.floorW, t.floorH);
+
+        // Minor 5m gridlines
+        ctx.strokeStyle = 'rgba(30, 41, 59, 0.55)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let x = 0; x <= WAREHOUSE_W; x += 5) {
+          const cx = toCanvasX(t, x);
+          ctx.moveTo(cx, t.originY);
+          ctx.lineTo(cx, t.originY + t.floorH);
+        }
+        for (let y = 0; y <= WAREHOUSE_H; y += 5) {
+          const cy = toCanvasY(t, y);
+          ctx.moveTo(t.originX, cy);
+          ctx.lineTo(t.originX + t.floorW, cy);
+        }
+        ctx.stroke();
+
+        // Major 20m gridlines & labels
+        ctx.strokeStyle = 'rgba(51, 65, 85, 0.65)';
+        ctx.fillStyle = '#64748b';
+        ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.beginPath();
+        for (let x = 0; x <= WAREHOUSE_W; x += 20) {
+          const cx = toCanvasX(t, x);
+          ctx.moveTo(cx, t.originY);
+          ctx.lineTo(cx, t.originY + t.floorH);
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'top';
+          ctx.fillText(`${x}m`, cx, t.originY + t.floorH + 6);
+        }
+        for (let y = 0; y <= WAREHOUSE_H; y += 20) {
+          const cy = toCanvasY(t, y);
+          ctx.moveTo(t.originX, cy);
+          ctx.lineTo(t.originX + t.floorW, cy);
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(`${y}m`, t.originX - 6, cy);
+        }
+        ctx.stroke();
+
+        // Storage / Aisle Zones
+        for (const z of RACK_ZONES) {
+          const rx = toCanvasX(t, z.x);
+          const ry = toCanvasY(t, z.y);
+          const rw = z.w * t.scale;
+          const rh = z.h * t.scale;
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+          ctx.strokeStyle = 'rgba(51, 65, 85, 0.85)';
+          ctx.lineWidth = 1;
+          ctx.fillRect(rx, ry, rw, rh);
+          ctx.strokeRect(rx, ry, rw, rh);
+
+          // Aisle bay slats
+          ctx.strokeStyle = 'rgba(30, 41, 59, 0.9)';
+          ctx.beginPath();
+          for (let i = 1; i < 4; i++) {
+            const sy = ry + (rh * i) / 4;
+            ctx.moveTo(rx, sy);
+            ctx.lineTo(rx + rw, sy);
+          }
+          ctx.stroke();
+
+          ctx.fillStyle = 'rgba(100, 116, 139, 0.75)';
+          ctx.font = 'bold 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(z.label, rx + rw / 2, ry + rh / 2);
+        }
+
+        // Dock Bays
+        for (const d of DOCK_STATIONS) {
+          const dx = toCanvasX(t, d.x);
+          const dy = toCanvasY(t, d.y);
+          const r = Math.max(12, 3.2 * t.scale);
+          ctx.save();
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
+          ctx.fillStyle = 'rgba(14, 116, 144, 0.14)';
+          ctx.setLineDash([4, 3]);
+          ctx.lineWidth = 1.25;
+          ctx.fillRect(dx - r, dy - r, r * 2, r * 2);
+          ctx.strokeRect(dx - r, dy - r, r * 2, r * 2);
+          ctx.restore();
+
+          ctx.fillStyle = 'rgba(125, 211, 252, 0.8)';
+          ctx.font = 'bold 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'bottom';
+          ctx.fillText(d.label, dx, dy - r - 3);
+        }
+
+        // Charging Stations
+        for (const c of CHARGING_STATIONS) {
+          const cx = toCanvasX(t, c.x);
+          const cy = toCanvasY(t, c.y);
+          const r = Math.max(10, 2.5 * t.scale);
+          ctx.fillStyle = 'rgba(245, 158, 11, 0.15)';
+          ctx.strokeStyle = 'rgba(245, 158, 11, 0.65)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = '#fbbf24';
+          ctx.font = 'bold 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('⚡', cx, cy);
+
+          ctx.fillStyle = 'rgba(251, 191, 36, 0.85)';
+          ctx.font = 'bold 9px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.textBaseline = 'top';
+          ctx.fillText(c.label, cx, cy + r + 3);
+        }
+
+        // Outer floor border
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(t.originX, t.originY, t.floorW, t.floorH);
+      }
+
+      function drawVehicles(t, dtSec) {
+        const lerpAlpha = 1 - Math.exp(-10 * dtSec);
+
+        for (const agv of agvs.values()) {
+          agv.renderX += (agv.x_coord - agv.renderX) * lerpAlpha;
+          agv.renderY += (agv.y_coord - agv.renderY) * lerpAlpha;
+
+          const cx = toCanvasX(t, agv.renderX);
+          const cy = toCanvasY(t, agv.renderY);
+          const cls = classifyVehicle(agv);
+          const isSelected = agv.device_id === selectedId;
+          const isHovered = agv.device_id === hoveredId;
+
+          // Subtle motion trail
+          if (agv.trail && agv.trail.length > 1) {
+            ctx.beginPath();
+            for (let i = 0; i < agv.trail.length; i++) {
+              const pt = agv.trail[i];
+              const px = toCanvasX(t, pt.x);
+              const py = toCanvasY(t, pt.y);
+              if (i === 0) ctx.moveTo(px, py);
+              else ctx.lineTo(px, py);
+            }
+            ctx.lineTo(cx, cy);
+            ctx.strokeStyle = cls.ring;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+
+          // Selection / hover reticle
+          if (isSelected || isHovered) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, isSelected ? 15 : 13, 0, Math.PI * 2);
+            ctx.strokeStyle = isSelected ? '#22d3ee' : 'rgba(148, 163, 184, 0.7)';
+            ctx.lineWidth = isSelected ? 2 : 1.5;
+            ctx.stroke();
+          }
+
+          // Glow halo
+          ctx.beginPath();
+          ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+          ctx.fillStyle = cls.ring;
+          ctx.fill();
+
+          // Vehicle body
+          ctx.beginPath();
+          ctx.arc(cx, cy, 7.5, 0, Math.PI * 2);
+          ctx.fillStyle = cls.hex;
+          ctx.fill();
+          ctx.strokeStyle = '#020617';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+
+          // Heading indicator when moving
+          if ((agv.speed || 0) > 0.05) {
+            const hx = cx + Math.cos(agv.heading) * 11;
+            const hy = cy + Math.sin(agv.heading) * 11;
+            ctx.beginPath();
+            ctx.moveTo(cx + Math.cos(agv.heading) * 5, cy + Math.sin(agv.heading) * 5);
+            ctx.lineTo(hx, hy);
+            ctx.strokeStyle = '#f8fafc';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+          }
+
+          // Label tag
+          const label = agv.device_id.replace('AGV-', '');
+          ctx.font = 'bold 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'bottom';
+          ctx.fillStyle = isSelected ? '#22d3ee' : '#e2e8f0';
+          ctx.fillText(label, cx, cy - 10);
+        }
+      }
+
+      let lastFrameTime = performance.now();
+      function animate(now) {
+        const dtSec = Math.min(0.1, Math.max(0.001, (now - lastFrameTime) / 1000));
+        lastFrameTime = now;
+
+        const t = computeFloorTransform();
+        lastTransform = t;
+        drawFloor(t);
+        drawVehicles(t, dtSec);
+        requestAnimationFrame(animate);
+      }
+      requestAnimationFrame(animate);
+
+      // Canvas hit testing
+      function findAgvAtPoint(clientX, clientY) {
+        if (!lastTransform) return null;
+        const rect = canvas.getBoundingClientRect();
+        const mx = clientX - rect.left;
+        const my = clientY - rect.top;
+
+        let closestId = null;
+        let closestDist = 20;
+        for (const agv of agvs.values()) {
+          const cx = toCanvasX(lastTransform, agv.renderX);
+          const cy = toCanvasY(lastTransform, agv.renderY);
+          const d = Math.hypot(mx - cx, my - cy);
+          if (d < closestDist) {
+            closestDist = d;
+            closestId = agv.device_id;
+          }
+        }
+        return closestId;
+      }
+
+      canvas.addEventListener('mousemove', (e) => {
+        const hit = findAgvAtPoint(e.clientX, e.clientY);
+        hoveredId = hit;
+        canvas.style.cursor = hit ? 'pointer' : 'default';
+      });
+
+      canvas.addEventListener('mouseleave', () => {
+        hoveredId = null;
+        canvas.style.cursor = 'default';
+      });
+
+      canvas.addEventListener('click', (e) => {
+        const hit = findAgvAtPoint(e.clientX, e.clientY);
+        if (hit) {
+          selectAgv(hit);
+        }
+      });
+
+      clearAlertsBtn.addEventListener('click', () => {
+        alerts.length = 0;
+        renderAlerts();
+      });
+
+      // Live ping age refresh & periodic fleet list sync
+      setInterval(() => {
+        updatePingAge();
+      }, 200);
+
+      // WebSocket connection with automatic reconnect
+      let reconnectDelay = 1000;
+      let fleetRenderScheduled = false;
+
+      function scheduleUiSync() {
+        if (fleetRenderScheduled) return;
+        fleetRenderScheduled = true;
+        requestAnimationFrame(() => {
+          fleetRenderScheduled = false;
+          renderFleetList();
+          renderSelectedPanel();
+        });
+      }
+
+      function connectWS() {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${proto}//${window.location.host}/ws`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          wsConnected = true;
+          serverHealthy = true;
+          reconnectDelay = 1000;
+          updatePipelineBanner(null);
+        };
+
+        ws.onmessage = (evt) => {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'snapshot') {
+              if (Array.isArray(msg.agvs)) {
+                for (const ev of msg.agvs) {
+                  upsertTelemetry(ev, true);
+                }
+              }
+              if (msg.metrics) {
+                serverHealthy = msg.metrics.status === 'HEALTHY';
+                updatePipelineBanner(msg.metrics);
+              }
+              scheduleUiSync();
+            } else if (msg.type === 'telemetry' && msg.event) {
+              upsertTelemetry(msg.event, false);
+              activeAgvsEl.textContent = String(agvs.size);
+              scheduleUiSync();
+            } else if (msg.type === 'metrics' && msg.metrics) {
+              serverHealthy = msg.metrics.status === 'HEALTHY';
+              updatePipelineBanner(msg.metrics);
+            }
+          } catch (err) {
+            console.error('Failed to parse WebSocket message:', err);
+          }
+        };
+
+        ws.onclose = () => {
+          wsConnected = false;
+          serverHealthy = false;
+          updatePipelineBanner(null);
+          setTimeout(connectWS, reconnectDelay);
+          reconnectDelay = Math.min(5000, Math.round(reconnectDelay * 1.5));
+        };
+
+        ws.onerror = () => {
+          ws.close();
+        };
+      }
+
+      connectWS();
+    })();
+  </script>
+</body>
+</html>

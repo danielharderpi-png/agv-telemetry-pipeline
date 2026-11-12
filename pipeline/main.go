@@ -6,12 +6,17 @@ import (
 	"errors"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"sync"
+	"sync/atomic"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/segmentio/kafka-go"
@@ -22,8 +27,13 @@ const (
 	defaultTopic       = "agv-telemetry"
 	defaultGroupID     = "agv-indexer"
 	defaultPostgresDSN = "postgres://agv_admin:agv_password@127.0.0.1:5433/warehouse_telemetry?sslmode=disable"
+	defaultHTTPAddr    = ":8081"
 	batchSize          = 50
 	batchInterval      = 1 * time.Second
+
+	wsWriteWait  = 5 * time.Second
+	wsPongWait   = 60 * time.Second
+	wsPingPeriod = 30 * time.Second
 )
 
 const schemaSQL = `
@@ -61,6 +71,296 @@ type TelemetryEvent struct {
 type bufferedRecord struct {
 	event TelemetryEvent
 	msg   kafka.Message
+}
+
+// PipelineMetrics reports real-time throughput and fleet health over WebSocket.
+type PipelineMetrics struct {
+	Status       string    `json:"status"`
+	EventsPerSec float64   `json:"events_per_sec"`
+	ActiveAGVs   int       `json:"active_agvs"`
+	TotalEvents  int64     `json:"total_events"`
+	TotalIndexed int64     `json:"total_indexed"`
+	Timestamp    time.Time `json:"timestamp"`
+}
+
+type wsEnvelope struct {
+	Type    string           `json:"type"`
+	Event   *TelemetryEvent  `json:"event,omitempty"`
+	AGVs    []TelemetryEvent `json:"agvs,omitempty"`
+	Metrics *PipelineMetrics `json:"metrics,omitempty"`
+}
+
+var wsUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type wsClient struct {
+	hub  *Hub
+	conn *websocket.Conn
+	send chan []byte
+}
+
+func (c *wsClient) readPump() {
+	defer func() {
+		select {
+		case c.hub.unregister <- c:
+		case <-c.hub.done:
+		}
+		_ = c.conn.Close()
+	}()
+	c.conn.SetReadLimit(4096)
+	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+	for {
+		if _, _, err := c.conn.ReadMessage(); err != nil {
+			break
+		}
+	}
+}
+
+func (c *wsClient) writePump() {
+	ticker := time.NewTicker(wsPingPeriod)
+	defer func() {
+		ticker.Stop()
+		_ = c.conn.Close()
+	}()
+	for {
+		select {
+		case msg, ok := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// Hub maintains the latest AGV state map, throughput counters, and WebSocket subscribers.
+type Hub struct {
+	mu           sync.RWMutex
+	latest       map[string]TelemetryEvent
+	lastRate     float64
+	windowEvents atomic.Int64
+	totalEvents  atomic.Int64
+	totalIndexed atomic.Int64
+
+	clients    map[*wsClient]struct{}
+	register   chan *wsClient
+	unregister chan *wsClient
+	broadcast  chan []byte
+	done       chan struct{}
+}
+
+func newHub() *Hub {
+	return &Hub{
+		latest:     make(map[string]TelemetryEvent),
+		clients:    make(map[*wsClient]struct{}),
+		register:   make(chan *wsClient, 32),
+		unregister: make(chan *wsClient, 32),
+		broadcast:  make(chan []byte, 512),
+		done:       make(chan struct{}),
+	}
+}
+
+// RecordEvent updates the in-memory AGV state map and broadcasts without blocking the caller.
+func (h *Hub) RecordEvent(ev TelemetryEvent) {
+	h.windowEvents.Add(1)
+	h.totalEvents.Add(1)
+
+	h.mu.Lock()
+	h.latest[ev.DeviceID] = ev
+	h.mu.Unlock()
+
+	payload, err := json.Marshal(wsEnvelope{
+		Type:  "telemetry",
+		Event: &ev,
+	})
+	if err != nil {
+		return
+	}
+
+	select {
+	case h.broadcast <- payload:
+	default:
+		// Drop broadcast frame if hub queue is saturated so Kafka/Postgres never blocks.
+	}
+}
+
+// AddIndexed records the number of events persisted to Postgres.
+func (h *Hub) AddIndexed(n int) {
+	h.totalIndexed.Add(int64(n))
+}
+
+func (h *Hub) currentMetrics(rate float64) PipelineMetrics {
+	h.mu.RLock()
+	active := len(h.latest)
+	h.mu.RUnlock()
+
+	return PipelineMetrics{
+		Status:       "HEALTHY",
+		EventsPerSec: rate,
+		ActiveAGVs:   active,
+		TotalEvents:  h.totalEvents.Load(),
+		TotalIndexed: h.totalIndexed.Load(),
+		Timestamp:    time.Now().UTC(),
+	}
+}
+
+func (h *Hub) buildSnapshot() []byte {
+	h.mu.RLock()
+	agvs := make([]TelemetryEvent, 0, len(h.latest))
+	for _, ev := range h.latest {
+		agvs = append(agvs, ev)
+	}
+	rate := h.lastRate
+	h.mu.RUnlock()
+
+	sort.Slice(agvs, func(i, j int) bool {
+		return agvs[i].DeviceID < agvs[j].DeviceID
+	})
+
+	metrics := PipelineMetrics{
+		Status:       "HEALTHY",
+		EventsPerSec: rate,
+		ActiveAGVs:   len(agvs),
+		TotalEvents:  h.totalEvents.Load(),
+		TotalIndexed: h.totalIndexed.Load(),
+		Timestamp:    time.Now().UTC(),
+	}
+
+	data, err := json.Marshal(wsEnvelope{
+		Type:    "snapshot",
+		AGVs:    agvs,
+		Metrics: &metrics,
+	})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func (h *Hub) fanOut(msg []byte) {
+	for client := range h.clients {
+		select {
+		case client.send <- msg:
+		default:
+			close(client.send)
+			delete(h.clients, client)
+		}
+	}
+}
+
+func (h *Hub) run(ctx context.Context) {
+	defer close(h.done)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	lastTick := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			for client := range h.clients {
+				close(client.send)
+				delete(h.clients, client)
+			}
+			return
+
+		case client := <-h.register:
+			h.clients[client] = struct{}{}
+			if snap := h.buildSnapshot(); snap != nil {
+				select {
+				case client.send <- snap:
+				default:
+					close(client.send)
+					delete(h.clients, client)
+				}
+			}
+
+		case client := <-h.unregister:
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+			}
+
+		case msg := <-h.broadcast:
+			h.fanOut(msg)
+
+		case now := <-ticker.C:
+			elapsed := now.Sub(lastTick).Seconds()
+			lastTick = now
+			count := h.windowEvents.Swap(0)
+			rate := 0.0
+			if elapsed > 0 {
+				rate = math.Round((float64(count)/elapsed)*10) / 10
+			}
+			h.mu.Lock()
+			h.lastRate = rate
+			h.mu.Unlock()
+
+			metrics := h.currentMetrics(rate)
+			if payload, err := json.Marshal(wsEnvelope{
+				Type:    "metrics",
+				Metrics: &metrics,
+			}); err == nil {
+				h.fanOut(payload)
+			}
+		}
+	}
+}
+
+func (h *Hub) serveWS(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("websocket upgrade failed: %v", err)
+		return
+	}
+
+	client := &wsClient{
+		hub:  h,
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
+
+	select {
+	case h.register <- client:
+	case <-h.done:
+		_ = conn.Close()
+		return
+	case <-ctx.Done():
+		_ = conn.Close()
+		return
+	}
+
+	go client.writePump()
+	go client.readPump()
+}
+
+func resolveWebDir() string {
+	if dir := strings.TrimSpace(os.Getenv("WEB_DIR")); dir != "" {
+		return dir
+	}
+	if info, err := os.Stat("../web"); err == nil && info.IsDir() {
+		return "../web"
+	}
+	if info, err := os.Stat("web"); err == nil && info.IsDir() {
+		return "web"
+	}
+	return "../web"
 }
 
 func envOrDefault(key, fallback string) string {
@@ -131,6 +431,8 @@ func main() {
 	brokers := strings.Split(envOrDefault("KAFKA_BROKERS", defaultBrokerAddr), ",")
 	topic := envOrDefault("KAFKA_TOPIC", defaultTopic)
 	groupID := envOrDefault("KAFKA_GROUP_ID", defaultGroupID)
+	httpAddr := envOrDefault("HTTP_ADDR", defaultHTTPAddr)
+	webDir := resolveWebDir()
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -145,6 +447,27 @@ func main() {
 		log.Fatalf("failed to ensure agv_telemetry schema: %v", err)
 	}
 	log.Println("Connected to PostgreSQL and verified agv_telemetry schema.")
+
+	hub := newHub()
+	go hub.run(ctx)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		hub.serveWS(ctx, w, r)
+	})
+	mux.Handle("/", http.FileServer(http.Dir(webDir)))
+
+	httpSrv := &http.Server{
+		Addr:              httpAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		log.Printf("Dashboard & WebSocket server listening on %s (serving %s)", httpAddr, webDir)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:  brokers,
@@ -197,24 +520,30 @@ func main() {
 			log.Printf("error flushing batch of %d events: %v", len(buffer), err)
 			return
 		}
+		hub.AddIndexed(len(buffer))
 		buffer = buffer[:0]
+	}
+
+	shutdown := func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+		flush(shutdownCtx)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Shutdown signal received, flushing remaining events...")
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			flush(shutdownCtx)
-			cancel()
+			shutdown()
 			log.Println("Pipeline stopped cleanly.")
 			return
 
 		case msg, ok := <-msgCh:
 			if !ok {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				flush(shutdownCtx)
-				cancel()
+				shutdown()
 				return
 			}
 
@@ -227,6 +556,7 @@ func main() {
 				continue
 			}
 
+			hub.RecordEvent(ev)
 			buffer = append(buffer, bufferedRecord{event: ev, msg: msg})
 			if len(buffer) >= batchSize {
 				flush(ctx)

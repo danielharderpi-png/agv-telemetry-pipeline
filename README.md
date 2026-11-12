@@ -1,0 +1,212 @@
+# AGV Telemetry Pipeline
+
+High-throughput, event-driven warehouse AGV (Automated Guided Vehicle) telemetry ingestion pipeline and real-time dispatch control board.
+
+![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
+![Redpanda](https://img.shields.io/badge/Redpanda-Kafka%20API-E94E32?style=flat-square)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=flat-square&logo=docker&logoColor=white)
+![WebSockets](https://img.shields.io/badge/WebSockets-Gorilla-0F172A?style=flat-square)
+
+---
+
+## Live Demo
+
+> **[Insert Demo Video / Screenshot Here]**
+
+---
+
+## System Architecture
+
+Telemetry flows from simulated warehouse vehicles through Redpanda into a Go ingestion service that splits each event across a non-blocking real-time WebSocket hub and a buffered PostgreSQL batch writer.
+
+### Flow Diagram
+
+```mermaid
+flowchart LR
+    SIM["Python Fleet Simulator\n10 AGVs | 20 events/sec\nsimulator/producer.py"]
+    RP["Redpanda Broker\nlocalhost:19092\ntopic: agv-telemetry"]
+    GO["Go Consumer & Hub\npipeline/main.go\ngroup: agv-indexer"]
+    BATCH["Buffered Batch Persister\npgx/v5 SendBatch\n50 records or 1s flush"]
+    PG[("PostgreSQL 16\n127.0.0.1:5433\nwarehouse_telemetry")]
+    WS["WebSocket Broadcaster\n:8081/ws\nNon-blocking fan-out"]
+    UI["2D Dispatch Control UI\nweb/index.html\n100m x 80m Canvas"]
+
+    SIM -->|"JSON events (key: device_id)"| RP
+    RP -->|"FetchMessage"| GO
+    GO -->|"Append to batch buffer"| BATCH
+    BATCH -->|"INSERT batch"| PG
+    BATCH -.->|"CommitMessages on DB success"| RP
+    GO -->|"RecordEvent (drop-on-full)"| WS
+    WS -->|"snapshot / telemetry / metrics"| UI
+```
+
+### Component Topology
+
+```text
++----------------------------------+
+|  Python Fleet Simulator          |
+|  simulator/producer.py           |
+|  - 10 AGVs (AGV-001 .. AGV-010)  |
+|  - 20 events/sec                 |
+|  - State machine & waypoints     |
++----------------+-----------------+
+                 |  Kafka protocol (topic: agv-telemetry)
+                 v
++----------------------------------+
+|  Redpanda Broker (:19092)        |
+|  Redpanda Console (:8080)        |
++----------------+-----------------+
+                 |  Consumer group: agv-indexer
+                 v
++-------------------------------------------------------------------+
+|  Go Ingestion & Dispatch Server (pipeline/main.go)                |
+|                                                                   |
+|  +-----------------------------+   +---------------------------+  |
+|  | Buffered Batch Persister    |   | WebSocket Hub (:8081/ws)  |  |
+|  | - pgx/v5 SendBatch          |   | - In-memory state map     |  |
+|  | - Flush every 50 ev or 1s   |   | - Atomic ev/s counter     |  |
+|  | - Post-flush CommitMessages |   | - Drop-on-full fan-out    |  |
+|  +--------------+--------------+   +-------------+-------------+  |
++-----------------|--------------------------------|----------------+
+                  |                                |
+                  v                                v
++----------------------------------+  +-----------------------------+
+|  PostgreSQL 16 (host :5433)      |  | 2D Dispatch UI (:8081/)     |
+|  db: warehouse_telemetry         |  | web/index.html              |
+|  table: agv_telemetry            |  | 100m x 80m live floor map   |
++----------------------------------+  +-----------------------------+
+```
+
+---
+
+## Key Engineering Highlights
+
+### 1. Backpressure-Safe Decoupling (Real-Time vs. Persistence)
+- `Hub.RecordEvent` updates the in-memory `latest` vehicle map under a short-lived `sync.RWMutex`, increments atomic throughput counters, and sends serialized JSON to a buffered `broadcast` channel (capacity `512`) using a non-blocking `select` with a `default` branch.
+- Each WebSocket subscriber gets its own buffered `send` channel (capacity `256`) serviced by a dedicated `writePump` goroutine. If a browser tab stalls or disconnects, `Hub.fanOut` closes and evicts the slow client immediately so neither the hub nor the Kafka-to-Postgres loop ever blocks.
+
+### 2. At-Least-Once Delivery Guarantees
+- Kafka offsets are never auto-committed before persistence. `main()` buffers decoded `bufferedRecord` items (`event` + raw `kafka.Message`) and flushes at `batchSize = 50` or `batchInterval = 1s`.
+- `flushBatch` executes all inserts via `pgx.Batch` (`pool.SendBatch`), checks every queued statement result and `br.Close()`, and calls `reader.CommitMessages` only after PostgreSQL confirms the batch. On `SIGINT`/`SIGTERM`, pending buffered records are flushed before exit.
+
+### 3. Zero-Build Industrial Dispatch Control Board
+- Served directly by the Go binary from `web/index.html` using HTML5, Tailwind CDN, and Vanilla JS (no bundler or Node build step).
+- **100m × 80m Spatial Canvas**: HiDPI-scaled floor grid rendering storage aisles (`AISLE A`–`D`), charging pads (`CHG-1`–`CHG-3`), and loading docks (`DOCK-W/N/S/E`) matching the simulator's coordinate space, with 60fps position interpolation, heading vectors, and motion trails.
+- **Health Color-Coding**:
+  - **Green**: Normal operation (`MOVING`, `IDLE`, `LOADING`, `UNLOADING`, battery ≥ 25%)
+  - **Amber**: Battery `< 25%` or `CHARGING`
+  - **Red**: Battery `< 15%` or `ERROR` / `STALLED`
+- **Vehicle Inspector & Alert Feed**: Clicking any AGV on the canvas or in the 5×2 fleet roster displays live battery percentage, speed (`m/s`), `(x, y)` coordinates, and live ping age. Faults (`ERROR`/`STALLED`) and low-battery events (`< 20%`) populate a throttled Recent Alerts feed.
+
+---
+
+## Telemetry Data Contract
+
+### Simulator JSON Event (`agv-telemetry`)
+
+Emitted by `simulator/producer.py` at 20 events/sec across `AGV-001` through `AGV-010` (`device_id` used as the Kafka message key):
+
+```json
+{
+  "device_id": "AGV-004",
+  "battery_level": 78.42,
+  "x_coord": 44.812,
+  "y_coord": 23.195,
+  "speed": 1.68,
+  "status": "MOVING",
+  "timestamp": "2026-11-11T20:15:02.418291+00:00"
+}
+```
+
+Valid `status` values generated by the simulator: `MOVING`, `CHARGING`, `IDLE`, `LOADING`, `UNLOADING`, `ERROR`.
+
+### PostgreSQL Schema (`agv_telemetry`)
+
+Automatically verified on startup by `ensureSchema` in `pipeline/main.go`:
+
+```sql
+CREATE TABLE IF NOT EXISTS agv_telemetry (
+    id SERIAL PRIMARY KEY,
+    device_id VARCHAR(32) NOT NULL,
+    battery_level INT NOT NULL,
+    x_coord DOUBLE PRECISION NOT NULL,
+    y_coord DOUBLE PRECISION NOT NULL,
+    speed DOUBLE PRECISION NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agv_device ON agv_telemetry(device_id);
+CREATE INDEX IF NOT EXISTS idx_agv_time ON agv_telemetry(timestamp DESC);
+```
+
+---
+
+## Quick Start & Verification
+
+### 1. Start Infrastructure (Redpanda, Redpanda Console, PostgreSQL 16)
+
+```powershell
+docker compose up -d
+docker compose ps
+```
+
+### 2. Start the Go Consumer & WebSocket Server
+
+```powershell
+cd pipeline
+go run .
+```
+
+Default configuration (overridable via `POSTGRES_DSN`, `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_GROUP_ID`, `HTTP_ADDR`, `WEB_DIR`):
+- Kafka broker: `localhost:19092` (`agv-telemetry`, group `agv-indexer`)
+- PostgreSQL DSN: `postgres://agv_admin:agv_password@127.0.0.1:5433/warehouse_telemetry?sslmode=disable`
+- HTTP / WebSocket server: `:8081` (serving `../web`)
+
+### 3. Start the Python Fleet Simulator
+
+In a separate terminal from the project root:
+
+```powershell
+pip install -r simulator/requirements.txt
+python simulator/producer.py
+```
+
+### 4. Open Dashboards
+
+- **Live AGV Dispatch UI**: http://localhost:8081
+- **Redpanda Console**: http://localhost:8080
+
+### 5. Verify Indexed Telemetry in PostgreSQL
+
+```powershell
+docker exec -it agv-postgres psql -U agv_admin -d warehouse_telemetry -c "SELECT COUNT(*) AS total_rows, COUNT(DISTINCT device_id) AS active_agvs FROM agv_telemetry;"
+```
+
+Inspect the latest telemetry per vehicle:
+
+```powershell
+docker exec -it agv-postgres psql -U agv_admin -d warehouse_telemetry -c "SELECT DISTINCT ON (device_id) device_id, battery_level, x_coord, y_coord, speed, status, timestamp FROM agv_telemetry ORDER BY device_id, timestamp DESC;"
+```
+
+---
+
+## Repository Structure
+
+```text
+agv-telemetry-pipeline/
+├── docker-compose.yml        # Redpanda, Redpanda Console, and PostgreSQL 16
+├── pipeline/
+│   ├── go.mod
+│   ├── go.sum
+│   └── main.go               # Kafka consumer, pgx batch writer, HTTP/WS hub (:8081)
+├── simulator/
+│   ├── producer.py           # 10-AGV kinematic & battery simulator (20 events/sec)
+│   └── requirements.txt      # kafka-python
+├── web/
+│   └── index.html            # Zero-build 2D warehouse dispatch dashboard
+└── README.md
+```
