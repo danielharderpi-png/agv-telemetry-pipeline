@@ -13,7 +13,7 @@ High-throughput, event-driven warehouse AGV (Automated Guided Vehicle) telemetry
 
 ## Live Demo
 
-> **[Insert Demo Video / Screenshot Here]**
+https://github.com/user-attachments/assets/b9192ccc-ff49-4957-9cf3-ea9ddd83e811
 
 ---
 
